@@ -1,15 +1,20 @@
 import argparse
+from asyncio import tasks
 import multiprocessing
 import json
-import os
+import asyncio
+import aiohttp
+from os import path, getenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib import request
+from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from yarl import URL
 
 MAX_WORKERS = multiprocessing.cpu_count()
 GOOGLE_SEARCH_API_BASE = "https://www.googleapis.com/customsearch/v1"
 
+IGNORE_TYPE = {".img", ".jpg", ".png", ".jpeg", ".gif", ".mp3", ".mp4", ".cgi", ".wav", ".avi", "wmv", "flv"}
 
 # 1. start from a set of seed pages obtained from a major search engine
 # given a query (a set of keywords) provided by auser, your crawler should contact a major search engine 
@@ -41,44 +46,73 @@ def parse_args():
   parser.add_argument("-k", "--keyword", help="Search keyword", action="store_true", default="python")
   return parser.parse_args()
 
-def load_url(obj, timeout=3000):
-  with request.urlopen(obj, timeout=timeout) as conn:
-    return conn.read().decode('utf-8')
 
-# {
-#   "kind": "customsearch#result",
-#   "title": "The Python Standard Library — Python 3.9.7 documentation",
-#   "htmlTitle": "The \u003cb\u003ePython\u003c/b\u003e Standard Library — \u003cb\u003ePython\u003c/b\u003e 3.9.7 documentation",
-#   "link": "https://docs.python.org/3/library/",
-#   "displayLink": "docs.python.org",
-#   "snippet": "It also describes some of the optional components that are commonly included in Python distributions. Python's standard library is very extensive, offering a ...",
-#   "htmlSnippet": "It also describes some of the optional components that are commonly included in \u003cb\u003ePython\u003c/b\u003e distributions. \u003cb\u003ePython&#39;s\u003c/b\u003e standard library is very extensive, offering a&nbsp;...",
-#   "cacheId": "nTas6KVcOSQJ",
-#   "formattedUrl": "https://docs.python.org/3/library/",
-#   "htmlFormattedUrl": "https://docs.\u003cb\u003epython\u003c/b\u003e.org/3/library/"
-# },
-def get_seed_urls(init_url):
-  results = load_url(init_url)
+async def load_url(url, timeout=5):
+  resp = await session.get(url, timeout=timeout)
+  return await resp.text()
+
+
+# given an initial search query and return an array of seed urls
+async def get_seed_urls(init_url):
+  results = await load_url(init_url)
   return [item['formattedUrl'] for item in json.loads(results)['items']]
 
-if __name__ == "__main__":
-  load_dotenv()
-  args = parse_args()
-  URLS = get_seed_urls(
-    "{}?key={}&cx={}&q={}".format(
-      GOOGLE_SEARCH_API_BASE, 
-      os.getenv("GOOGLE_SEARCH_API_KEY"), 
-      os.getenv("GOOGLE_SEARCH_ENGINE_ID"), 
-      args.keyword)
-  )
 
-  with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    future_to_url = {executor.submit(load_url, url, 60): url for url in URLS}
-    for future in as_completed(future_to_url):
-      url = future_to_url[future]
-      try:
-        data = future.result()
-      except Exception as exc:
-        print('%r generated an exception: %s' % (url, exc))
-      else:
-        print('%r page is %d bytes' % (url, len(data)))
+# implement the robot exclusion protocol
+async def robot_exclusion(url):
+  await asyncio.sleep(1)
+  return set()
+
+
+# A JOB as a thread pool task, which takes an url and return the sub-urls from given HTML docs
+async def url_job(url):
+  parsed_url = urlparse(url)
+  self_req_scheme, self_netloc = parsed_url.scheme, parsed_url.netloc
+  html_doc = await load_url(url)
+  soup = BeautifulSoup(html_doc, "html.parser")
+  url_set = set()
+  exclusion_set = await robot_exclusion(urljoin(f"{self_req_scheme}://{self_netloc}", "robots.txt"))
+  for link in soup.find_all("a"):
+    result = urlparse(link.get("href"))
+    url = result.netloc if result.netloc else self_netloc + result.path
+    if not url:
+      continue
+    file_name, file_extension = path.splitext(url)
+    if file_extension in IGNORE_TYPE or url in exclusion_set:
+      continue
+    url_set.add(url)
+  return url_set
+
+async def main():
+  global session
+  async with aiohttp.ClientSession() as session:
+    load_dotenv()
+    args = parse_args()
+    URLS = await get_seed_urls(
+      "{}?key={}&cx={}&q={}".format(
+        GOOGLE_SEARCH_API_BASE, 
+        getenv("GOOGLE_SEARCH_API_KEY"), 
+        getenv("GOOGLE_SEARCH_ENGINE_ID"), 
+        args.keyword)
+    )
+    await url_job(URLS[0])
+
+
+if __name__ == "__main__":
+  routine = main()
+  try:
+    asyncio.run(routine)
+  except Exception as e:
+    print("[{}]: {}".format(type(e).__name__, e))
+  finally:
+    print("Exiting...")
+  # with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+  #   future_to_url = {executor.submit(load_url, url, 60): url for url in URLS}
+  #   for future in as_completed(future_to_url):
+  #     url = future_to_url[future]
+  #     try:
+  #       data = future.result()
+  #     except Exception as exc:
+  #       print('%r generated an exception: %s' % (url, exc))
+  #     else:
+  #       print('%r page is %d bytes' % (url, len(data)))
