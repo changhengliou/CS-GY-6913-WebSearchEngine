@@ -1,15 +1,16 @@
 import argparse
-from asyncio import tasks
 import multiprocessing
 import json
 import asyncio
 import aiohttp
+import logging
+import traceback
+import time
 from os import path, getenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from yarl import URL
 
 MAX_WORKERS = multiprocessing.cpu_count()
 GOOGLE_SEARCH_API_BASE = "https://www.googleapis.com/customsearch/v1"
@@ -47,34 +48,58 @@ def parse_args():
   return parser.parse_args()
 
 
-async def load_url(url, timeout=5):
-  resp = await session.get(url, timeout=timeout)
-  return await resp.text()
+async def get_req(url, timeout=5):
+  try:
+    resp = await session.get(url, timeout=timeout)
+    resp.raise_for_status()
+    return await resp.text(), True
+  except:
+    logging.error(traceback.format_exc())
+    return None, False
 
 
 # given an initial search query and return an array of seed urls
 async def get_seed_urls(init_url):
-  results = await load_url(init_url)
+  results, ok = await get_req(init_url)
+  if not ok:
+    raise Exception("Failed to get results from root server")
   return [item['formattedUrl'] for item in json.loads(results)['items']]
 
 
 # implement the robot exclusion protocol
+# this is not perferct, some paths use wildcard characters, ex: /*/api
 async def robot_exclusion(url):
-  await asyncio.sleep(1)
-  return set()
+  exclusion_set = set()
+  try:
+    async with session.get(url) as resp:
+      if resp.status >= 400:
+        return exclusion_set
+      txt = await resp.text()
+      parsed_url = urlparse(url)
+      self_req_scheme, self_netloc = parsed_url.scheme, parsed_url.netloc
+      exclusion_set.update(
+        list(map(lambda x: urljoin(f"{self_req_scheme}://{self_netloc}", x.replace("Disallow:", "", 1).strip()), 
+          filter(lambda x: x.startswith("Disallow:"), txt.splitlines())
+      )))
+      return exclusion_set
+  except:
+    logging.error(traceback.format_exc())
+  return exclusion_set
 
 
 # A JOB as a thread pool task, which takes an url and return the sub-urls from given HTML docs
 async def url_job(url):
   parsed_url = urlparse(url)
   self_req_scheme, self_netloc = parsed_url.scheme, parsed_url.netloc
-  html_doc = await load_url(url)
+  html_doc, ok = await get_req(url)
+  if not ok:
+    return
   soup = BeautifulSoup(html_doc, "html.parser")
   url_set = set()
   exclusion_set = await robot_exclusion(urljoin(f"{self_req_scheme}://{self_netloc}", "robots.txt"))
   for link in soup.find_all("a"):
     result = urlparse(link.get("href"))
-    url = result.netloc if result.netloc else self_netloc + result.path
+    url = urljoin(f"{self_req_scheme}://{result.netloc if result.netloc else self_netloc}", result.path)
     if not url:
       continue
     file_name, file_extension = path.splitext(url)
@@ -83,20 +108,18 @@ async def url_job(url):
     url_set.add(url)
   return url_set
 
+
 async def main():
   global session
   async with aiohttp.ClientSession() as session:
+    start = time.perf_counter()
     load_dotenv()
     args = parse_args()
-    URLS = await get_seed_urls(
-      "{}?key={}&cx={}&q={}".format(
-        GOOGLE_SEARCH_API_BASE, 
-        getenv("GOOGLE_SEARCH_API_KEY"), 
-        getenv("GOOGLE_SEARCH_ENGINE_ID"), 
-        args.keyword)
-    )
-    await url_job(URLS[0])
-
+    URLS = await get_seed_urls(f"{GOOGLE_SEARCH_API_BASE}?key={getenv('GOOGLE_SEARCH_API_KEY')}&cx={getenv('GOOGLE_SEARCH_ENGINE_ID')}&q={args.keyword}")
+    s = set()
+    for t in await asyncio.gather(*[url_job(url) for url in URLS]):
+      s.update(t)
+    print(f"Time elapsed: {time.perf_counter() - start:.3f}s, {len(s)} of URL found")
 
 if __name__ == "__main__":
   routine = main()
