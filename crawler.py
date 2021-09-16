@@ -9,10 +9,12 @@ import time
 from os import path, getenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, urljoin
+from urllib.robotparser import RobotFileParser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 MAX_WORKERS = multiprocessing.cpu_count()
+MAX_URL_SIZE = 10000
 GOOGLE_SEARCH_API_BASE = "https://www.googleapis.com/customsearch/v1"
 
 IGNORE_TYPE = {".img", ".jpg", ".png", ".jpeg", ".gif", ".mp3", ".mp4", ".cgi", ".wav", ".avi", "wmv", "flv"}
@@ -43,8 +45,9 @@ IGNORE_TYPE = {".img", ".jpg", ".png", ".jpeg", ".gif", ".mp3", ".mp4", ".cgi", 
 
 def parse_args():
   parser = argparse.ArgumentParser(description='Web crawler')
-  parser.add_argument("-d", "--depth", help="Maximum crawling depth", action="store_true", default=3)
-  parser.add_argument("-k", "--keyword", help="Search keyword", action="store_true", default="python")
+  parser.add_argument("-d", "--depth", help="Maximum crawling depth", default=3)
+  parser.add_argument("-k", "--keyword", help="Search keyword", default="python")
+  parser.add_argument("-s", "--size", help="Max Page Crawled", default=100)
   return parser.parse_args()
 
 
@@ -66,44 +69,24 @@ async def get_seed_urls(init_url):
   return [item['formattedUrl'] for item in json.loads(results)['items']]
 
 
-# implement the robot exclusion protocol
-# this is not perferct, some paths use wildcard characters, ex: /*/api
-async def robot_exclusion(url):
-  exclusion_set = set()
-  try:
-    async with session.get(url) as resp:
-      if resp.status >= 400:
-        return exclusion_set
-      txt = await resp.text()
-      parsed_url = urlparse(url)
-      self_req_scheme, self_netloc = parsed_url.scheme, parsed_url.netloc
-      exclusion_set.update(
-        list(map(lambda x: urljoin(f"{self_req_scheme}://{self_netloc}", x.replace("Disallow:", "", 1).strip()), 
-          filter(lambda x: x.startswith("Disallow:"), txt.splitlines())
-      )))
-      return exclusion_set
-  except:
-    logging.error(traceback.format_exc())
-  return exclusion_set
-
-
 # A JOB as a thread pool task, which takes an url and return the sub-urls from given HTML docs
 async def url_job(url):
   parsed_url = urlparse(url)
   self_req_scheme, self_netloc = parsed_url.scheme, parsed_url.netloc
   html_doc, ok = await get_req(url)
   if not ok:
-    return
+    return set()
   soup = BeautifulSoup(html_doc, "html.parser")
   url_set = set()
-  exclusion_set = await robot_exclusion(urljoin(f"{self_req_scheme}://{self_netloc}", "robots.txt"))
+  rp = RobotFileParser(urljoin(f"{self_req_scheme}://{self_netloc}", "robots.txt"))
+  rp.read()
   for link in soup.find_all("a"):
     result = urlparse(link.get("href"))
     url = urljoin(f"{self_req_scheme}://{result.netloc if result.netloc else self_netloc}", result.path)
     if not url:
       continue
     file_name, file_extension = path.splitext(url)
-    if file_extension in IGNORE_TYPE or url in exclusion_set:
+    if file_extension in IGNORE_TYPE or rp.can_fetch("*", url):
       continue
     url_set.add(url)
   return url_set
@@ -115,11 +98,24 @@ async def main():
     start = time.perf_counter()
     load_dotenv()
     args = parse_args()
-    URLS = await get_seed_urls(f"{GOOGLE_SEARCH_API_BASE}?key={getenv('GOOGLE_SEARCH_API_KEY')}&cx={getenv('GOOGLE_SEARCH_ENGINE_ID')}&q={args.keyword}")
-    s = set()
-    for t in await asyncio.gather(*[url_job(url) for url in URLS]):
-      s.update(t)
-    print(f"Time elapsed: {time.perf_counter() - start:.3f}s, {len(s)} of URL found")
+    MAX_URL_SIZE = int(args.size)
+    queue = await get_seed_urls(f"{GOOGLE_SEARCH_API_BASE}?key={getenv('GOOGLE_SEARCH_API_KEY')}&cx={getenv('GOOGLE_SEARCH_ENGINE_ID')}&q={args.keyword}")
+    url_set = set(queue)
+    batch_size = 100
+    count = 0
+    while count < MAX_URL_SIZE:
+      curr = queue[:batch_size]
+      queue = queue[batch_size:]
+      count += len(curr)
+      print(f"{count} urls crawled")
+      for result in await asyncio.gather(*[url_job(url) for url in curr]):
+        for url in result:
+          if url not in url_set:
+            url_set.add(url)
+            queue.append(url)
+    
+    print(url_set)
+    print(f"Time elapsed: {time.perf_counter() - start:.3f}s, {len(url_set)} of URL found")
 
 if __name__ == "__main__":
   routine = main()
